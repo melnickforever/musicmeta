@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+#my specific files
+.claude/
+metadata_corrected.json
+metadata.json
+metadata_corrected2.json
