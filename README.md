@@ -88,8 +88,20 @@ python3 ai_fill.py /path/to/music/metadata.json --model gpt-oss:20b -o metadata_
 - `--correct`: the model may also change existing values (typos, case).
 - The model output is shown live. `--quiet` hides it.
 - `--think show|hide`: `hide` (default) = the model thinks but only the answer is printed; `show` = the thinking is printed too. The model must support thinking (e.g. `gpt-oss:20b`).
-- If the answer is cut off or the JSON is invalid: `--batch 15` (fewer tracks per request; by default a whole album is sent at once so its values stay consistent) or a bigger `--num-ctx`.
+- `--batch N`: tracks per request (default 4; `0` = the whole album in one request). If the answer is cut off or the JSON is invalid, lower it or raise `--num-ctx`.
+- `--save-after N`: write the result file after every N processed tracks, not only at the end (default 0 = only at the end). Progress is not lost if the run is interrupted.
+- `--resume`: if the result file already exists, keep the tracks it has finished and process only the missing or unfinished ones. Use the same input file and `-o` as the interrupted run. Without `--resume` an existing result file is overwritten.
+- Tracks the model finished but left blank count as finished. To retry them, delete the result file or run without `--resume`.
+- Parameters are validated at start (missing input file, bad numbers, bad `--host`, missing output folder) and a clear error is printed.
 - Other options: `--model`, `--host`, `--prompt`, `--retries`, `--timeout`.
+
+Example of a long run that can be continued:
+
+```bash
+python3 ai_fill.py metadata.json -o metadata_corrected.json --save-after 20
+# interrupted? run the same command again with --resume
+python3 ai_fill.py metadata.json -o metadata_corrected.json --save-after 20 --resume
+```
 
 Option B, any chat AI: paste `promt.txt` followed by `metadata.json`, save the
 JSON answer as `metadata_corrected.json`.
@@ -141,5 +153,7 @@ only edit tags; audio data is not rewritten.
   or install `python3-mutagen` with your distro package manager.
 - `Cannot reach Ollama`: start the Ollama app or `ollama serve`.
 - `Model '...' is not installed`: `ollama pull <model>`.
+- `input file not found` / `... is not valid JSON` / `has no "tracks" list`: pass the `metadata.json` written by `musicmeta.py`.
+- Run stopped halfway: start it again with `--resume` (and `--save-after N` to checkpoint more often).
 - `invalid answer` / `answer was cut off`: lower `--batch`, raise `--num-ctx`.
 - DSF/MP3 tag not updated in the media server: rescan the library in the server.

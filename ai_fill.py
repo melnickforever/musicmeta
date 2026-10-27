@@ -22,6 +22,8 @@ Usage:
   python ai_fill.py test/metadata.json --correct -o metadata_corrected.json
   python ai_fill.py test/metadata.json --think show   # watch the reasoning
   python ai_fill.py test/metadata.json --think hide   # think, but print only the answer (default)
+  python ai_fill.py test/metadata.json --save-after 20   # write the result file every 20 tracks
+  python ai_fill.py test/metadata.json --resume          # continue an interrupted run
 
 Needs a running Ollama (ollama serve) and a pulled model (ollama pull <name>).
 No extra Python packages are required.
@@ -257,7 +259,7 @@ def collect_items(data):
     for parent in data.get("tracks", []):
         entries = parent.get("tracks") or [parent]
 
-        for entry in entries:
+        for index, entry in enumerate(entries):
             meta = entry.get("metadata")
             if not isinstance(meta, dict):
                 meta = {}
@@ -265,9 +267,41 @@ def collect_items(data):
             for field in FIELDS:
                 meta.setdefault(field, "")
 
-            items.append({"parent": parent, "entry": entry})
+            key = (parent.get("path", ""), index if entry is not parent else None)
+            items.append({"parent": parent, "entry": entry, "key": key})
 
     return items
+
+
+def is_done(entry):
+    """A track already went through the model (or was checked and skipped)."""
+    return "confidence" in entry
+
+
+def apply_previous(items, output):
+    """Copy finished tracks from an earlier result file. Returns how many."""
+    try:
+        with open(output, encoding="utf-8") as handle:
+            previous = json.load(handle)
+    except (OSError, ValueError) as e:
+        print(f"Cannot resume from {output} ({e}), starting from scratch.")
+        return 0
+
+    finished = {
+        i["key"]: i["entry"] for i in collect_items(previous) if is_done(i["entry"])
+    }
+
+    restored = 0
+    for item in items:
+        old = finished.get(item["key"])
+        if old is None:
+            continue
+        entry = item["entry"]
+        entry.clear()
+        entry.update(old)
+        restored += 1
+
+    return restored
 
 
 def group_by_folder(items):
@@ -464,16 +498,17 @@ def init_skipped(item):
     entry["confidence"] = "HIGH"
 
 
-def process_group(args, system, folder, items):
+def process_group(args, system, folder, items, checkpoint=None):
     """Ask the model about one album, in batches. Returns (changed, issues)."""
     changed, issues = 0, []
 
     # Without --correct only tracks with a blank required field need the model.
+    pending = [i for i in items if not is_done(i["entry"])]
     if args.correct:
-        todo = items
+        todo = pending
     else:
-        todo = [i for i in items if has_blank(i)]
-        for item in items:
+        todo = [i for i in pending if has_blank(i)]
+        for item in pending:
             if item not in todo:
                 init_skipped(item)
 
@@ -514,6 +549,9 @@ def process_group(args, system, folder, items):
         count, notes = merge_result(part, result, args.correct)
         changed += count
         issues.extend(notes)
+
+        if checkpoint:
+            checkpoint(len(part))
 
     fixed = harmonize(items)
     if fixed:
@@ -577,9 +615,40 @@ def main():
         help="max tracks per request (default 4, keeps the context small); "
         "0 = the whole album in one request",
     )
+    parser.add_argument(
+        "--save-after",
+        type=int,
+        default=0,
+        help="write the result file after every N processed tracks, "
+        "not only at the end (default 0 = only at the end)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="if the output file exists, keep its finished tracks and only "
+        "process the tracks that are missing or unfinished in it",
+    )
     parser.add_argument("--retries", type=int, default=2, help="tries per request (default 2)")
     parser.add_argument("--timeout", type=int, default=600, help="seconds per request (default 600)")
     args = parser.parse_args()
+
+    for name, minimum in (
+        ("save_after", 0),
+        ("batch", 0),
+        ("retries", 1),
+        ("num_ctx", 1),
+        ("timeout", 1),
+    ):
+        if getattr(args, name) < minimum:
+            flag = "--" + name.replace("_", "-")
+            parser.error(f"{flag} must be {minimum} or more (got {getattr(args, name)})")
+
+    if not os.path.isfile(args.json_file):
+        parser.error(f"input file not found: {args.json_file}")
+    if not os.path.isfile(args.prompt):
+        parser.error(f"prompt file not found: {args.prompt}")
+    if not args.host.startswith(("http://", "https://")):
+        parser.error(f"--host must start with http:// or https:// (got {args.host})")
 
     output = args.output
     if not output:
@@ -589,8 +658,23 @@ def main():
     if os.path.abspath(output) == os.path.abspath(args.json_file):
         sys.exit("Output must differ from the input file.")
 
-    with open(args.json_file, encoding="utf-8") as handle:
-        data = json.load(handle)
+    out_dir = os.path.dirname(os.path.abspath(output))
+    if not os.path.isdir(out_dir):
+        parser.error(f"output folder does not exist: {out_dir}")
+
+    try:
+        with open(args.json_file, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except ValueError as e:
+        sys.exit(f"{args.json_file} is not valid JSON: {e}")
+    except OSError as e:
+        sys.exit(f"Cannot read {args.json_file}: {e}")
+
+    if not isinstance(data, dict) or not isinstance(data.get("tracks"), list):
+        sys.exit(f'{args.json_file} has no "tracks" list: is it a metadata.json from musicmeta.py?')
+
+    if args.resume and not os.path.exists(output):
+        print(f"Resume: {output} does not exist yet, starting from scratch.")
 
     system = load_prompt(args.prompt)
     args.model = check_ollama(args.host, args.model)
@@ -598,16 +682,37 @@ def main():
     items = collect_items(data)
     groups = group_by_folder(items)
 
+    if args.resume and os.path.exists(output):
+        restored = apply_previous(items, output)
+        print(f"Resume: {restored} of {len(items)} tracks already done in {output}")
+
     mode = "correct + fill" if args.correct else "fill empty fields only"
     print(f"Model: {args.model}   Mode: {mode}")
     print(f"{len(items)} tracks in {len(groups)} albums\n")
 
     albums = []
     total = 0
+    since_save = 0
+
+    def save():
+        data["albums"] = albums
+        tmp = output + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(tmp, output)
+
+    def checkpoint(count):
+        nonlocal since_save
+        since_save += count
+        if args.save_after > 0 and since_save >= args.save_after:
+            since_save = 0
+            save()
+            print(f"    (saved progress to {output})")
 
     for number, (folder, group) in enumerate(groups.items(), 1):
         print(f"[{number}/{len(groups)}] {os.path.basename(folder)} ({len(group)} tracks)")
-        changed, issues = process_group(args, system, folder, group)
+        changed, issues = process_group(args, system, folder, group, checkpoint)
         total += changed
         print(f"    {changed} field(s) changed")
 
@@ -628,11 +733,7 @@ def main():
             }
         )
 
-    data["albums"] = albums
-
-    with open(output, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    save()
 
     flagged = sum(1 for a in albums if a["issues"])
     print(f"\nFields changed: {total}. Albums with notes to review: {flagged}.")
