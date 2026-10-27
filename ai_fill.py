@@ -275,7 +275,7 @@ def collect_items(data):
 
 def is_done(entry):
     """A track already went through the model (or was checked and skipped)."""
-    return "confidence" in entry
+    return bool(entry.get("ai_done"))
 
 
 def apply_previous(items, output):
@@ -414,6 +414,7 @@ def merge_result(items, result, correct):
                     unresolved.append(field)
                 review.append(f"{field}: no evidence, please verify")
 
+        entry["ai_done"] = True
         entry["missing"] = [f for f in FIELDS if not clean(meta.get(f))]
         entry["changes"] = changes
         entry["review"] = review
@@ -491,6 +492,7 @@ def init_skipped(item):
     """Bookkeeping for a track that is not sent to the model."""
     entry = item["entry"]
     entry.setdefault("sources", {})
+    entry["ai_done"] = True
     entry["missing"] = [f for f in FIELDS if not clean(entry["metadata"].get(f))]
     entry["changes"] = []
     entry["review"] = []
@@ -680,6 +682,8 @@ def main():
     args.model = check_ollama(args.host, args.model)
 
     items = collect_items(data)
+    for item in items:
+        item["entry"].pop("ai_done", None)  # only --resume may mark tracks as done
     groups = group_by_folder(items)
 
     if args.resume and os.path.exists(output):
